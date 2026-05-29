@@ -326,10 +326,16 @@ transfer_queue:
   # Pluggable storage and transport backend for TransferQueue
   backend:
 
-    # Storage backend type. Options: SimpleStorage, MooncakeStore (experimental)
-    storage_backend: SimpleStorage
+    # SimpleStorage with ZeroMQ
+    storage_backend: Yuanrong
 
-    # Backend-specific configurations
+    Yuanrong:
+        auto_init: True
+        worker_port: 31503
+        metastore_port: 2381
+        enable_yr_npu_transport: true
+        worker_args: "--shared_memory_size_mb 8192 --remote_h2d_device_ids 0 --enable_huge_tlb true"
+
     # SimpleStorage: ZMQ-based in-memory storage for out-of-the-box usage
     SimpleStorage:
 

@@ -90,7 +90,7 @@ from verl.utils.config import omega_conf_to_dataclass, validate_config
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
 from verl.utils.debug.metrics import calculate_debug_metrics
-from verl.utils.device import auto_set_device
+from verl.utils.device import auto_set_device, is_npu_available
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
@@ -189,6 +189,77 @@ def compute_advantage_for_multi_trajectories(
     data.batch["advantages"] = scores
     data.batch["returns"] = scores
     return data
+
+
+def _convert_to_nested_tensor_dict(data_dict):
+    """Convert NonTensorData/NonTensorStack values from kv_batch_get to tensors or nested tensors."""
+
+    def convert(value):
+        if isinstance(value, NonTensorData):
+            value = value.data
+
+        if isinstance(value, torch.Tensor):
+            return value
+
+        if isinstance(value, NonTensorStack) or type(value).__name__ == "LinkedList":
+            values = [convert(v) for v in value]
+            if all(isinstance(v, torch.Tensor) for v in values):
+                if any(v.is_nested for v in values):
+                    return values[0] if len(values) == 1 else value
+                target_device = values[0].device
+                return torch.nested.as_nested_tensor([v.to(target_device) for v in values], layout=torch.jagged)
+            return value
+
+        return value
+
+    for key, value in list(data_dict.items()):
+        converted_value = convert(value)
+        is_tensor = isinstance(converted_value, torch.Tensor)
+        is_nested = converted_value.is_nested if is_tensor else False
+        device_info = str(converted_value.device) if is_tensor else "N/A"
+        print(
+            f"[TQConvert] key={key}, "
+            f"value_type={type(value).__name__}, "
+            f"converted_type={type(converted_value).__name__}, "
+            f"is_tensor={is_tensor}, "
+            f"is_nested={is_nested}, "
+            f"device={device_info}"
+        )
+        data_dict[key] = converted_value
+    return data_dict
+
+
+def _maybe_move_fields_to_npu(fields: TensorDict, config) -> TensorDict:
+    """Move tensor fields to NPU for direct transfer when using Yuanrong backend.
+
+    No-op unless NPU is available AND the TransferQueue storage backend is Yuanrong.
+    Top-level torch.Tensor columns are moved directly. The ``multi_modal_inputs``
+    column is a NonTensorStack of dicts, so we descend one level to move the
+    tensors inside each dict (e.g. pixel_values, image_grid_thw).
+    """
+    if not is_npu_available:
+        print(f'is_npu_available: {is_npu_available}')
+        return fields
+    if config.transfer_queue.backend.storage_backend != "Yuanrong":
+        print(f'is_yuanrong: {is_npu_available}')
+        return fields
+    for k, v in fields.items():
+        if torch.is_tensor(v):
+            fields[k] = v.to("npu")
+            print(f'{k} {v} to npu')
+        elif k == "multi_modal_inputs":
+            for mm_dict in v:
+                for kk, vv in mm_dict.items():
+                    if isinstance(vv, torch.Tensor):
+                        mm_dict[kk] = vv.to("npu")
+    for k, v in fields.items():
+        print(
+            f'[DeviceCheck][after_move] fields["{k}"] type: {type(v)}, '
+            f'is_tensor: {isinstance(v, torch.Tensor)}, '
+            f'is_nested: {v.layout == torch.jagged if isinstance(v, torch.Tensor) else "N/A"}, '
+            f'device: {v.device if hasattr(v, "device") else "N/A"}'
+        )
+    return fields
 
 
 class ReplayBuffer:
@@ -441,9 +512,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 }
             )
 
+        fields = list_of_dict_to_tensordict(fields)
+        fields = _maybe_move_fields_to_npu(fields, self.config)
         await tq.async_kv_batch_put(
             keys=keys,
-            fields=list_of_dict_to_tensordict(fields),
+            fields=fields,
             tags=tags,
             partition_id="train" if not validate else "val",
         )
@@ -661,7 +734,6 @@ class PPOTrainer:
             )
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
-            logger.info(f"create worker group {spawn_wg.keys()}")
 
         # 5. initialize critic model engine
         if self.use_critic:
@@ -913,6 +985,7 @@ class PPOTrainer:
             text_data = tq.kv_batch_get(
                 keys=batch.keys, partition_id=batch.partition_id, select_fields=["prompts", "responses"]
             )
+            text_data = _convert_to_nested_tensor_dict(text_data)
             text_data["prompts"] = text_data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             text_data["responses"] = text_data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
@@ -920,6 +993,7 @@ class PPOTrainer:
 
             fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
             data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
+            data = _convert_to_nested_tensor_dict(data)
 
             sample_uids.extend(data.pop("uid").tolist())
             sample_outputs.extend(all_outputs[i] for i in final_indices)
@@ -1100,6 +1174,7 @@ class PPOTrainer:
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            data = _convert_to_nested_tensor_dict(data)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
@@ -1231,6 +1306,7 @@ class PPOTrainer:
         baseline_data = tq.kv_batch_get(
             keys=baseline_keys, partition_id=batch.partition_id, select_fields=["uid", "rm_scores"]
         )
+        baseline_data = _convert_to_nested_tensor_dict(baseline_data)
         baseline_scores = baseline_data["rm_scores"].sum(dim=-1)
         baseline_by_uid = {
             uid.removeprefix(baseline_prefix): score
@@ -1238,11 +1314,14 @@ class PPOTrainer:
         }
 
         sampled_data = tq.kv_batch_get(keys=sampled_keys, partition_id=batch.partition_id, select_fields=["uid"])
+        sampled_data = _convert_to_nested_tensor_dict(sampled_data)
         reward_baselines = torch.stack([baseline_by_uid[uid] for uid in list(sampled_data["uid"])])
+        fields = TensorDict({"reward_baselines": reward_baselines}, batch_size=len(sampled_keys))
+        fields = _maybe_move_fields_to_npu(fields, self.config)
         tq.kv_batch_put(
             keys=sampled_keys,
             partition_id=batch.partition_id,
-            fields=TensorDict({"reward_baselines": reward_baselines}, batch_size=len(sampled_keys)),
+            fields=fields,
         )
         tq.kv_clear(keys=all_baseline_keys, partition_id=batch.partition_id)
         self.replay_buffer.remove(batch.partition_id, all_baseline_keys)
@@ -1311,7 +1390,9 @@ class PPOTrainer:
             data = tq.kv_batch_get(
                 keys=batch.keys, partition_id=batch.partition_id, select_fields=["rollout_log_probs"]
             )
+            data = _convert_to_nested_tensor_dict(data)
             data["old_log_probs"] = data.pop("rollout_log_probs")
+            data = _maybe_move_fields_to_npu(data, self.config)
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
             return
 
@@ -1330,15 +1411,31 @@ class PPOTrainer:
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        data = _convert_to_nested_tensor_dict(data)
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
         data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+        put_fields = _maybe_move_fields_to_npu(data.select("old_log_probs", "entropy"), self.config)
+
         batch = tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
+            keys=batch.keys, partition_id=batch.partition_id, fields=put_fields
         )
 
+        data = _maybe_move_fields_to_npu(data, self.config)
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                print(
+                    f"[TQConvert][before_padding] key={k}, device={v.device}, "
+                    f"is_nested={v.is_nested}"
+                )
         data = DataProto(batch=data.to_padded_tensor())
+        for k, v in data.batch.items():
+            if isinstance(v, torch.Tensor):
+                print(
+                    f"[TQConvert][padded] key={k}, device={v.device}, "
+                    f"shape={tuple(v.shape)}, dtype={v.dtype}, is_nested={v.is_nested}"
+                )
 
         # 3. calculate actor entroy metrics
         actor_config = self.config.actor_rollout_ref.actor
@@ -1381,8 +1478,10 @@ class PPOTrainer:
         data = tq.kv_batch_get(
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
         )
+        data = _convert_to_nested_tensor_dict(data)
         data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
+        put_fields = _maybe_move_fields_to_npu(data.select("ref_log_prob"), self.config)
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=put_fields)
 
         return batch
 
@@ -1397,8 +1496,10 @@ class PPOTrainer:
         data = tq.kv_batch_get(
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
         )
+        data = _convert_to_nested_tensor_dict(data)
         data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("values"))
+        put_fields = _maybe_move_fields_to_npu(data.select("values"), self.config)
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=put_fields)
 
         return batch
 
@@ -1408,6 +1509,7 @@ class PPOTrainer:
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             fields.append("reward_baselines")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        data = _convert_to_nested_tensor_dict(data)
 
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
@@ -1460,6 +1562,7 @@ class PPOTrainer:
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         output = TensorDict(output, batch_size=len(batch))
+        output = _maybe_move_fields_to_npu(output, self.config)
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
 
@@ -1534,6 +1637,7 @@ class PPOTrainer:
             "num_turns",
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        data = _convert_to_nested_tensor_dict(data)
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
@@ -1548,6 +1652,7 @@ class PPOTrainer:
                 partition_id=batch.partition_id,
                 select_fields=["extra_fields"],
             )
+            spec_data = _convert_to_nested_tensor_dict(spec_data)
             extra_fields = spec_data["extra_fields"].tolist()
             spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
             spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields]
@@ -1753,7 +1858,7 @@ class PPOTrainer:
         return batch
 
 
-@ray.remote
+@ray.remote(resources={"NPU":0.01})
 class TaskRunner:
     def __init__(self) -> None:
         # role => worker class

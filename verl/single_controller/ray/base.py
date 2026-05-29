@@ -142,7 +142,7 @@ class RayResourcePool(ResourcePool):
 
         bundle = {"CPU": self.max_colocate_count}
         if self.use_gpu:
-            bundle[device_name] = 1
+            bundle[device_name] = 0.9
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
@@ -228,15 +228,15 @@ class ResourcePoolManager:
             for node, node_info in node_available_resources.items()
         }
 
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
-        total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
-        )
-        if total_available_gpus < total_required_gpus:
-            raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
-            )
+        # # check total required gpus can be satisfied
+        # total_available_gpus = sum(node_available_gpus.values())
+        # total_required_gpus = sum(
+        #     [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+        # )
+        # if total_available_gpus < total_required_gpus:
+        #     raise ValueError(
+        #         f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
+        #     )
 
 
 def extract_pg_from_exist(
@@ -368,7 +368,7 @@ class RayClassWithInitArgs(ClassWithInitArgs):
         placement_group,
         placement_group_bundle_idx,
         use_gpu: bool = True,
-        num_gpus=1,
+        num_gpus=0.9,
         sharing_with=None,
         device_name="cuda",
     ) -> Any:
@@ -624,7 +624,7 @@ class RayWorkerGroup(WorkerGroup):
         if self.use_gpu and not use_gpu:
             raise ValueError("use_gpu is True but resource_pool.use_gpu is False")
         local_world_size = resource_pool.store[0]
-        num_gpus = 1 / resource_pool.max_colocate_count
+        num_gpus = 0.9 / resource_pool.max_colocate_count
 
         # we pass in environment variable at option so that Worker can use environment variable to set
         env_vars = {

@@ -34,10 +34,23 @@ try:
 except ImportError:
     from verl.utils.transferqueue_utils import KVBatchMeta, tq
 
+from verl.utils.device import is_npu_available
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
+
+
+def move_padding_fields_to_npu(fields):
+    """Best-effort move padding tensor fields to NPU before putting them into TransferQueue."""
+    if not is_npu_available:
+        return fields
+
+    for key, value in fields.items():
+        if isinstance(value, torch.Tensor):
+            fields[key] = value.to("npu")
+            print(f'[DeviceCheck][padding] fields["{key}"] moved to {fields[key].device}')
+    return fields
 
 
 def build_padding_position_ids(source_position_ids: Any, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -98,6 +111,16 @@ def construct_minimal_padding_template(
     response_mask = torch.zeros_like(prompts)
     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
+
+    # Debug: verify padding sample device vs real sample device
+    real_lm = source_td.get("loss_mask")
+    print(
+        f"[Debug][padding] real loss_mask device: {real_lm.device if isinstance(real_lm, torch.Tensor) else 'N/A'}, "
+        f"real loss_mask shape: {real_lm.shape if hasattr(real_lm, 'shape') else 'N/A'}, "
+        f"padding prompts device: {prompts.device}, "
+        f"padding response_mask device: {response_mask.device}, "
+        f"padding response_mask shape: {response_mask.shape}"
+    )
 
     # Update the fields and remove redundant parts
     template_sample.update(
@@ -176,10 +199,12 @@ def upsample_batch_to_divisible_size(
         pad_fields.append(sample)
         pad_tags.append(copy.deepcopy(template_tag))
 
+    pad_fields = list_of_dict_to_tensordict(pad_fields)
+    pad_fields = move_padding_fields_to_npu(pad_fields)
     tq.kv_batch_put(
         keys=pad_keys,
         partition_id=batch.partition_id,
-        fields=list_of_dict_to_tensordict(pad_fields),
+        fields=pad_fields,
         tags=pad_tags,
     )
     logger.info(

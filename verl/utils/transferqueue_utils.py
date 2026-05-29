@@ -120,6 +120,24 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
     tq_client = tq.get_client()
     tensordict = await tq_client.async_get_data(meta)
 
+    # Fix: TransferQueue/ray serialization may convert nested tensors to NonTensorStack
+    # whose elements are NonTensorData wrapping tensors on different devices.
+    # Unwrap and convert them back to nested tensors on a uniform device.
+    for key, val in list(tensordict.items()):
+        if isinstance(val, NonTensorStack):
+            if all(isinstance(v, NonTensorData) and isinstance(v.data, torch.Tensor) for v in val):
+                tensors = [v.data for v in val]
+                target_device = tensors[0].device
+                tensordict[key] = torch.nested.as_nested_tensor(
+                    [t.to(target_device) for t in tensors], layout=torch.jagged
+                )
+            elif all(isinstance(v, torch.Tensor) for v in val):
+                tensors = list(val)
+                target_device = tensors[0].device
+                tensordict[key] = torch.nested.as_nested_tensor(
+                    [t.to(target_device) for t in tensors], layout=torch.jagged
+                )
+
     for key, val in meta_info.items():
         if isinstance(val, (NonTensorData | NonTensorStack)):
             tensordict[key] = val

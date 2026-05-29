@@ -90,7 +90,7 @@ from verl.utils.config import omega_conf_to_dataclass, validate_config
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
 from verl.utils.debug.metrics import calculate_debug_metrics
-from verl.utils.device import auto_set_device
+from verl.utils.device import auto_set_device, is_npu_available
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
@@ -189,6 +189,33 @@ def compute_advantage_for_multi_trajectories(
     data.batch["advantages"] = scores
     data.batch["returns"] = scores
     return data
+
+
+def _maybe_move_fields_to_npu(fields: TensorDict, config) -> TensorDict:
+    """Move tensor fields to NPU for direct transfer when using Yuanrong backend.
+
+    No-op unless NPU is available AND the TransferQueue storage backend is Yuanrong.
+    Top-level torch.Tensor columns are moved directly. The ``multi_modal_inputs``
+    column is a NonTensorStack of dicts, so we descend one level to move the
+    tensors inside each dict (e.g. pixel_values, image_grid_thw).
+
+    Note: This function must only be called from processes that actually have an
+    NPU device allocated (i.e. the main trainer process).  Ray worker processes
+    (``AgentLoopWorkerTQ``) do NOT have NPU access and must skip this call.
+    """
+    if not is_npu_available:
+        return fields
+    if config.transfer_queue.backend.storage_backend != "Yuanrong":
+        return fields
+    for k, v in fields.items():
+        if torch.is_tensor(v):
+            fields[k] = v.to("npu")
+        elif k == "multi_modal_inputs":
+            for mm_dict in v:
+                for kk, vv in mm_dict.items():
+                    if isinstance(vv, torch.Tensor):
+                        mm_dict[kk] = vv.to("npu")
+    return fields
 
 
 class ReplayBuffer:
@@ -441,9 +468,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 }
             )
 
+        fields = list_of_dict_to_tensordict(fields)
         await tq.async_kv_batch_put(
             keys=keys,
-            fields=list_of_dict_to_tensordict(fields),
+            fields=fields,
             tags=tags,
             partition_id="train" if not validate else "val",
         )
@@ -1239,10 +1267,12 @@ class PPOTrainer:
 
         sampled_data = tq.kv_batch_get(keys=sampled_keys, partition_id=batch.partition_id, select_fields=["uid"])
         reward_baselines = torch.stack([baseline_by_uid[uid] for uid in list(sampled_data["uid"])])
+        fields = TensorDict({"reward_baselines": reward_baselines}, batch_size=len(sampled_keys))
+        fields = _maybe_move_fields_to_npu(fields, self.config)
         tq.kv_batch_put(
             keys=sampled_keys,
             partition_id=batch.partition_id,
-            fields=TensorDict({"reward_baselines": reward_baselines}, batch_size=len(sampled_keys)),
+            fields=fields,
         )
         tq.kv_clear(keys=all_baseline_keys, partition_id=batch.partition_id)
         self.replay_buffer.remove(batch.partition_id, all_baseline_keys)
@@ -1312,6 +1342,7 @@ class PPOTrainer:
                 keys=batch.keys, partition_id=batch.partition_id, select_fields=["rollout_log_probs"]
             )
             data["old_log_probs"] = data.pop("rollout_log_probs")
+            data = _maybe_move_fields_to_npu(data, self.config)
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
             return
 
@@ -1334,8 +1365,9 @@ class PPOTrainer:
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
         data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+        put_fields = _maybe_move_fields_to_npu(data.select("old_log_probs", "entropy"), self.config)
         batch = tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
+            keys=batch.keys, partition_id=batch.partition_id, fields=put_fields
         )
 
         data = DataProto(batch=data.to_padded_tensor())
@@ -1382,7 +1414,8 @@ class PPOTrainer:
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
         )
         data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
+        put_fields = _maybe_move_fields_to_npu(data.select("ref_log_prob"), self.config)
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=put_fields)
 
         return batch
 
@@ -1398,7 +1431,8 @@ class PPOTrainer:
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
         )
         data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("values"))
+        put_fields = _maybe_move_fields_to_npu(data.select("values"), self.config)
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=put_fields)
 
         return batch
 
@@ -1460,6 +1494,7 @@ class PPOTrainer:
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         output = TensorDict(output, batch_size=len(batch))
+        output = _maybe_move_fields_to_npu(output, self.config)
 
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
 

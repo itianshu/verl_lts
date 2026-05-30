@@ -198,10 +198,6 @@ def _maybe_move_fields_to_npu(fields: TensorDict, config) -> TensorDict:
     Top-level torch.Tensor columns are moved directly. The ``multi_modal_inputs``
     column is a NonTensorStack of dicts, so we descend one level to move the
     tensors inside each dict (e.g. pixel_values, image_grid_thw).
-
-    Note: This function must only be called from processes that actually have an
-    NPU device allocated (i.e. the main trainer process).  Ray worker processes
-    (``AgentLoopWorkerTQ``) do NOT have NPU access and must skip this call.
     """
     if not is_npu_available:
         return fields
@@ -321,7 +317,7 @@ class ReplayBuffer:
                     return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
 
-@ray.remote
+@ray.remote(num_npus=1)
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -469,6 +465,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             )
 
         fields = list_of_dict_to_tensordict(fields)
+        fields = _maybe_move_fields_to_npu(fields, self.config)
         await tq.async_kv_batch_put(
             keys=keys,
             fields=fields,

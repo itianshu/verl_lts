@@ -317,7 +317,7 @@ class ReplayBuffer:
                     return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
 
-@ray.remote(num_npus=1)
+@ray.remote(resources={"NPU": 1})
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

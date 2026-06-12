@@ -521,6 +521,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             partition_id="train" if not validate else "val",
         )
 
+        data = tq.kv_list(partition_id="train" if not validate else "val")
+        if data is not None:
+            for key in keys:
+                tag = data.get(key, {})
+                print(f"key={key}, status={tag.get('status')}")
+                assert tag.get("status") == "success", f"写入后 status 不是 success: {tag}"
+        else:
+            print(f"kv_list returned None immediately after async_kv_batch_put")
+
+
 
 class AgentLoopManagerTQ(AgentLoopManager):
     def __init__(self, *args, replay_buffer: ReplayBuffer, **kwargs):
